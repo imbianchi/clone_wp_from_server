@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "clone-stg": "ts-node src/index.ts staging-to-local"
   },
   "keywords": [],
   "author": "",
