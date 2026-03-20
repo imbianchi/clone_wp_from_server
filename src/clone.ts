@@ -1,77 +1,85 @@
-// src/clone.ts
-import { execSync } from 'child_process';
+import { execSync, exec } from 'child_process';
 import * as fs from 'fs';
-import { updateDatabaseValues, updateWpConfig } from './db';
+import * as os from 'os';
+import * as path from 'path';
+import { SiteConfig, ComposeContext } from './types';
+import { ensureInfraRunning, generateSiteCompose, siteComposePath, startSiteService, startSiteAll } from './docker';
+import { waitForMySQL, createDatabase, importDatabase, updateSiteUrls, configureWpForLocal } from './database';
+import { TRAEFIK_PORT } from './constants';
 
+const TOTAL_STEPS = 9;
+const step = (n: number, msg: string) => console.log(`\n[${n}/${TOTAL_STEPS}] ${msg}`);
 
-const checkAndCreateDatabase = async (dbName: string, dbUser: string, dbPassword: string, dbHost: string) => {
-    const checkQuery = `SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '${dbName}'`;
-    const createQuery = `CREATE DATABASE ${dbName}`;
-
-    try {
-        const exists = execSync(`mysql --user=${dbUser} --password=${dbPassword} --host=${dbHost} -e "${checkQuery}"`, { stdio: 'pipe' });
-        if (exists.toString().includes(dbName)) {
-            console.log(`Database '${dbName}' already exists.`);
-        } else {
-            throw new Error('Database does not exist');
-        }
-    } catch (error) {
-        execSync(`mysql --user=${dbUser} --password=${dbPassword} --host=${dbHost} -e "${createQuery}"`);
-        console.log(`Database '${dbName}' created successfully.`);
-    }
+const buildTheme = (config: SiteConfig): void => {
+    if (!config.THEME_GIT_PATH || !config.THEME_BUILD_CMD) return;
+    // Theme assets (dist/) are gitignored — must be compiled locally after clone
+    execSync(`cd ${config.THEME_GIT_PATH} && npm install --silent && ${config.THEME_BUILD_CMD}`, { stdio: 'inherit' });
 };
 
-// Clone application based on the environment
-export const cloneApp = async (env: 'STAGING' | 'PROD') => {
-    const SSH_USER = process.env[`${env}_SSH_USER`];
-    const SSH_HOST = process.env[`${env}_SSH_HOST`];
-    const WP_PATH = process.env[`${env}_WP_PATH`];
-    const LOCAL_PATH = process.env.LOCAL_WP_PATH;
-    const LOCAL_URL = process.env.LOCAL_URL;
-    const LOCAL_DB_NAME = process.env.LOCAL_DB_NAME;
-    const LOCAL_DB_USER = process.env.LOCAL_DB_USER;
-    const LOCAL_DB_PASSWORD = process.env.LOCAL_DB_PASSWORD;
-    const LOCAL_DB_HOST = process.env.LOCAL_DB_HOST;
-    const SSH_KEY = process.env.SSH_KEY;
+export const cloneToDocker = (config: SiteConfig): void => {
+    const { SSH_USER, SSH_HOST, SSH_KEY, WP_PATH } = config;
 
-    // Step 1: Remove existing local directory if it exists
-    if (LOCAL_PATH && fs.existsSync(LOCAL_PATH)) {
-        console.log("Removing existing local WordPress directory...");
-        execSync(`rm -rf ${LOCAL_PATH}`);
-    }
+    const siteSlug    = config.SITE_NAME.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const localWpPath = path.join(os.homedir(), 'wp-sites', siteSlug);
+    const localDbName = siteSlug.replace(/-/g, '_') + '_local';
+    const localUrl    = `http://${siteSlug}.localhost:${TRAEFIK_PORT}`;
 
-    // Step 2: Copy files from the remote server
-    console.log("Copying files from the remote server...");
-    execSync(`rsync -avz -e "ssh -i ${SSH_KEY}" ${SSH_USER}@${SSH_HOST}:${WP_PATH}/ ${LOCAL_PATH}/`);
+    const ctx: ComposeContext = {
+        projectName: siteSlug,
+        composePath: siteComposePath(siteSlug),
+    };
 
-    // Step 3: Export the remote database
-    console.log("Exporting the remote database...");
+    const themeExclude = config.THEME_WP_FOLDER
+        ? `--exclude='wp-content/themes/${config.THEME_WP_FOLDER}'`
+        : '';
+
+    console.log(`\nCloning [${config.SITE_NAME}]`);
+    console.log(`  ${SSH_USER}@${SSH_HOST}:${WP_PATH} → ${localWpPath}`);
+
+    step(1, 'Starting MySQL container...');
+    ensureInfraRunning();
+    generateSiteCompose(config, siteSlug, localWpPath, localDbName);
+    startSiteService(ctx, 'mysql');
+    waitForMySQL(ctx);
+
+    step(2, 'Syncing WordPress files from server...');
+    fs.rmSync(localWpPath, { recursive: true, force: true });
+    fs.mkdirSync(localWpPath, { recursive: true });
+    execSync(`rsync -az ${themeExclude} -e "ssh -i ${SSH_KEY}" ${SSH_USER}@${SSH_HOST}:${WP_PATH}/ ${localWpPath}/`, { stdio: 'inherit' });
+
+    step(3, 'Exporting remote database...');
     execSync(`ssh -i ${SSH_KEY} ${SSH_USER}@${SSH_HOST} "cd ${WP_PATH} && wp db export ${WP_PATH}/db_backup.sql"`);
+    execSync(`scp -i ${SSH_KEY} ${SSH_USER}@${SSH_HOST}:${WP_PATH}/db_backup.sql ./db_backup.sql`);
 
-    // Step 4: Copy the exported database backup to local
-    console.log("Copying the exported database backup to local...");
-    execSync(`scp -i ${SSH_KEY} ${SSH_USER}@${SSH_HOST}:${WP_PATH}/db_backup.sql ./`);
+    step(4, 'Importing database...');
+    createDatabase(ctx, localDbName);
+    importDatabase(ctx, localDbName, path.resolve('./db_backup.sql'));
 
-    // Step 5: Check if the local database exists, and create it if it doesn't
-    if (LOCAL_DB_NAME && LOCAL_DB_USER && LOCAL_DB_PASSWORD && LOCAL_DB_HOST) {
-        await checkAndCreateDatabase(LOCAL_DB_NAME, LOCAL_DB_USER, LOCAL_DB_PASSWORD, LOCAL_DB_HOST);
-    }
+    step(5, 'Configuring wp-config.php...');
+    configureWpForLocal(localWpPath, localDbName);
 
-    // Step 6: Import the database into the local environment
-    console.log("Importing the database...");
-    execSync(`mysql --user=${LOCAL_DB_USER} --password=${LOCAL_DB_PASSWORD} --host=${LOCAL_DB_HOST} ${LOCAL_DB_NAME} < db_backup.sql`);
+    step(6, 'Updating site URLs...');
+    updateSiteUrls(ctx, localDbName, localUrl);
 
-    // Step 7: Update siteurl and home values in the database
-    if (LOCAL_DB_NAME && LOCAL_DB_USER && LOCAL_DB_PASSWORD && LOCAL_DB_HOST && LOCAL_URL && LOCAL_PATH) {
-        updateDatabaseValues(LOCAL_DB_NAME, LOCAL_DB_USER, LOCAL_DB_PASSWORD, LOCAL_DB_HOST, LOCAL_URL);
-        updateWpConfig(LOCAL_PATH, LOCAL_DB_NAME, LOCAL_DB_USER, LOCAL_DB_PASSWORD, LOCAL_DB_HOST);
-    } else {
-        console.log("One or more environment variables are undefined.");
-    }
+    step(7, 'Building theme assets...');
+    buildTheme(config);
 
-    // Clean up
-    console.log("Cleaning up temporary files...");
-    execSync(`rm db_backup.sql`);
+    step(8, 'Cleaning up...');
+    execSync('rm -f db_backup.sql');
+    execSync(`ssh -i ${SSH_KEY} ${SSH_USER}@${SSH_HOST} "rm -f ${WP_PATH}/db_backup.sql"`);
 
-    console.log(`Cloning complete! Your local WordPress site is ready at ${LOCAL_URL}`);
+    step(9, 'Starting containers...');
+    startSiteAll(ctx);
+
+    const openCmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
+    exec(`${openCmd} ${localUrl}`);
+
+    console.log(`
+✓ Done! [${config.SITE_NAME}]
+
+  WordPress:  ${localUrl}
+  wp-admin:   ${localUrl}/wp-admin
+  MailHog:    http://mailhog.localhost:${TRAEFIK_PORT}
+${config.THEME_GIT_PATH ? `\n  Theme: cd ${config.THEME_GIT_PATH} && npm run dev` : ''}
+`);
 };

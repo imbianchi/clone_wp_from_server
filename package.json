@@ -4,8 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "clone-stg": "ts-node src/index.ts staging-to-local"
+    "clone": "ts-node src/index.ts",
+    "start": "docker compose up -d",
+    "stop": "docker compose down",
+    "logs": "docker compose logs -f wordpress"
   },
   "keywords": [],
   "author": "",

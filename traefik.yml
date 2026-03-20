@@ -1,0 +1,30 @@
+services:
+  traefik:
+    image: traefik:v3
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=wp-local
+      - --entrypoints.web.address=:8090
+    ports:
+      - "8090:8090"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - wp-local
+    restart: unless-stopped
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.mailhog.rule=Host(`mailhog.localhost`)
+      - traefik.http.routers.mailhog.entrypoints=web
+      - traefik.http.services.mailhog.loadbalancer.server.port=8025
+    networks:
+      - wp-local
+    restart: unless-stopped
+
+networks:
+  wp-local:
+    external: true
